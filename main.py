@@ -12,6 +12,7 @@ import database
 from auth import create_access_token, verify_token, get_user_from_token, UserAuth
 import sys
 import logging
+import uvicorn
 
 # Configure logging to go to both console and file
 logging.basicConfig(
@@ -24,7 +25,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-load_dotenv() 
 
 app = FastAPI(title="Voice Assistant API")
 
@@ -38,6 +38,11 @@ app.add_middleware(
 
 api_key = os.getenv("GROQ_API_KEY")
 client = AsyncGroq(api_key=api_key) if api_key else None
+
+@app.on_event("startup")
+async def startup_event():
+    log.info(f"GROQ_API_KEY present: {'Yes' if os.getenv('GROQ_API_KEY') else 'No'}")
+    log.info(f"Edge TTS Voice: {EDGE_TTS_VOICE}")
 
 SYSTEM_PROMPT = {
     "role": "system",
@@ -531,3 +536,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
             pass
 
     log.info(f"Client disconnected from thread {thread_id}")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))  # Railway injects PORT automatically
+    uvicorn.run(app, host="0.0.0.0", port=port)
