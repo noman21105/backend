@@ -537,6 +537,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
 
     log.info(f"Client disconnected from thread {thread_id}")
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Voice Assistant API is running!"}
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))  # Railway injects PORT automatically
     uvicorn.run(app, host="0.0.0.0", port=port)
