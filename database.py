@@ -52,7 +52,9 @@ init_db()
 # Sync helpers that we will run via asyncio.to_thread
 
 def _create_user(username, password):
-    hash_password = pwd_context.hash(password)
+    # Bcrypt has a 72-byte limit; truncate to ensure compatibility
+    safe_password = password[:72]
+    hash_password = pwd_context.hash(safe_password)
     with get_connection() as conn:
         cursor = conn.cursor()
         try:
@@ -63,11 +65,13 @@ def _create_user(username, password):
             return None # Username exists
 
 def _verify_user(username, password):
+    # Bcrypt has a 72-byte limit; truncate to ensure compatibility
+    safe_password = password[:72]
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, username, password_hash FROM users WHERE username = ?", (username,))
         user = cursor.fetchone()
-        if user and pwd_context.verify(password, user[2]):
+        if user and pwd_context.verify(safe_password, user[2]):
             return {"id": user[0], "username": user[1]}
         return None
 
