@@ -1,9 +1,7 @@
 import sqlite3
 import asyncio
 from datetime import datetime
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+import bcrypt
 
 DB_FILE = "chat_history.db"
 
@@ -52,26 +50,26 @@ init_db()
 # Sync helpers that we will run via asyncio.to_thread
 
 def _create_user(username, password):
-    # Bcrypt has a 72-byte limit; truncate to ensure compatibility
-    safe_password = password[:72]
-    hash_password = pwd_context.hash(safe_password)
+    # Bcrypt has a 72-byte limit; truncate at the byte level
+    pw_bytes = password.encode("utf-8")[:72]
+    hashed = bcrypt.hashpw(pw_bytes, bcrypt.gensalt())
     with get_connection() as conn:
         cursor = conn.cursor()
         try:
-            cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hash_password))
+            cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hashed.decode("utf-8")))
             conn.commit()
             return {"id": cursor.lastrowid, "username": username}
         except sqlite3.IntegrityError:
             return None # Username exists
 
 def _verify_user(username, password):
-    # Bcrypt has a 72-byte limit; truncate to ensure compatibility
-    safe_password = password[:72]
+    # Bcrypt has a 72-byte limit; truncate at the byte level
+    pw_bytes = password.encode("utf-8")[:72]
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, username, password_hash FROM users WHERE username = ?", (username,))
         user = cursor.fetchone()
-        if user and pwd_context.verify(safe_password, user[2]):
+        if user and bcrypt.checkpw(pw_bytes, user[2].encode("utf-8")):
             return {"id": user[0], "username": user[1]}
         return None
 
