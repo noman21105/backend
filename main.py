@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import json
 import base64
@@ -13,6 +14,8 @@ from auth import create_access_token, verify_token, get_user_from_token, UserAut
 import sys
 import logging
 import uvicorn
+
+# load_dotenv()
 
 # Configure logging to go to both console and file
 logging.basicConfig(
@@ -262,6 +265,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
     message_queue = asyncio.Queue()
     interrupt_event = asyncio.Event()
     disconnect_event = asyncio.Event()
+    last_interrupt_time = [0.0]
+    INTERRUPT_COOLDOWN = 1.0
 
     async def keepalive_task():
         """Sends a ping every 20s to prevent idle WebSocket disconnection."""
@@ -285,14 +290,31 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
                 data = json.loads(raw)
                 msg_type = data.get("type")
 
-                if msg_type == "chat" or msg_type == "audio_input":
-                    # Signal any in-progress generation to stop
-                    interrupt_event.set()
-                    # Put the new message in the queue for the processor
+                now = time.time()
+                is_cooldown_ok = (now - last_interrupt_time[0] > INTERRUPT_COOLDOWN)
+
+                if msg_type == "chat":
+                    if is_cooldown_ok:
+                        interrupt_event.set()
+                        last_interrupt_time[0] = now
                     await message_queue.put(data)
+                elif msg_type == "audio_input":
+                    content = data.get("content", "")
+                    audio_bytes = base64.b64decode(content)
+                    log.info(f"[WS] INTERRUPT TRY: size={len(audio_bytes)}, queue={message_queue.qsize()}")
+                    
+                    if len(audio_bytes) > 8000:
+                        if is_cooldown_ok:
+                            log.info("[WS] INTERRUPT TRIGGERED")
+                            interrupt_event.set()
+                            last_interrupt_time[0] = now
+                        await message_queue.put(data)
+                    else:
+                        log.info("[WS] Ignored tiny noise payload")
                 elif msg_type == "interrupt":
-                    # User explicitly requested interrupt (e.g. started speaking)
-                    interrupt_event.set()
+                    if is_cooldown_ok:
+                        interrupt_event.set()
+                        last_interrupt_time[0] = now
                 # Ignore 'ping' type messages from client (if any)
         except WebSocketDisconnect:
             disconnect_event.set()
@@ -302,7 +324,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
 
     async def prep_llm():
         history = await database.get_messages_async(thread_id)
-        history = history[-10:]
+        history = history[-6:]
         messages_for_llm = [SYSTEM_PROMPT] + [
             {"role": m["role"], "content": m["content"]} for m in history
         ]
@@ -332,7 +354,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
                 audio_file = ("audio.wav", wav_header + audio_bytes, "audio/wav")
                 transcription_resp = await client.audio.transcriptions.create(
                     file=audio_file,
-                    model="whisper-large-v3",
+                    model="whisper-large-v3-turbo",
                     temperature=0.0
                 )
                 content = transcription_resp.text.strip()
@@ -364,7 +386,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
                 await websocket.send_json({"type": "transcribing"})
                 transcription_resp = await client.audio.transcriptions.create(
                     file=audio_file,
-                    model="whisper-large-v3",
+                    model="whisper-large-v3-turbo",
                     temperature=0.0
                 )
                 content = transcription_resp.text.strip()
@@ -417,9 +439,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
                 # Save user message
                 await database.add_message_async(thread_id, "user", content)
 
-                # Load conversation history (last 10 messages for decent context)
+                # Load conversation history (last 6 messages for speed)
                 history = await database.get_messages_async(thread_id)
-                history = history[-10:]
+                history = history[-6:]
 
                 messages_for_llm = [SYSTEM_PROMPT] + [
                     {"role": m["role"], "content": m["content"]} for m in history
@@ -429,9 +451,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
                 chat_completion = await client.chat.completions.create(
                     messages=messages_for_llm,
                     model="llama-3.1-8b-instant",
-                    temperature=0.7,
+                    temperature=0.5,
                     stream=True,
-                    max_tokens=150
+                    max_tokens=80
                 )
 
                 full_response = ""
@@ -439,6 +461,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
                 was_interrupted = False
 
                 tts_queue = asyncio.Queue()
+                token_buffer = ""
                 
                 async def tts_worker():
                     try:
@@ -467,23 +490,36 @@ async def websocket_endpoint(websocket: WebSocket, token: str, thread_id: int):
                     if token_text:
                         full_response += token_text
                         sentence_buffer += token_text
+                        token_buffer += token_text
                         
-                        try:
-                            await websocket.send_json({
-                                "type": "token",
-                                "content": token_text
-                            })
-                        except Exception:
-                            tts_worker_task.cancel()
-                            return  # WebSocket closed
+                        if len(token_buffer) > 20:
+                            try:
+                                await websocket.send_json({
+                                    "type": "token",
+                                    "content": token_buffer
+                                })
+                                token_buffer = ""
+                            except Exception:
+                                tts_worker_task.cancel()
+                                return  # WebSocket closed
 
-                        # Split on commas too for much faster Time-To-First-Audio
-                        if any(p in token_text for p in [".", "!", "?", "\n", ","]):
-                            sentences = re.split(r'(?<=[.!?\n,])\s+', sentence_buffer)
+                        # Split on common punctuation (ignoring commas for smoother TTS chunking)
+                        if any(p in token_text for p in [".", "!", "?", "\n"]):
+                            sentences = re.split(r'(?<=[.!?\n])\s+', sentence_buffer)
                             for s in sentences[:-1]:
                                 if s.strip():
                                     await tts_queue.put(s.strip())
                             sentence_buffer = sentences[-1]
+                            
+                # send remaining tokens
+                if token_buffer and not was_interrupted:
+                    try:
+                        await websocket.send_json({
+                            "type": "token",
+                            "content": token_buffer
+                        })
+                    except Exception:
+                        pass
 
                 if was_interrupted:
                     tts_worker_task.cancel()
